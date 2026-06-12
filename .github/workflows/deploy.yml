@@ -1,0 +1,115 @@
+name: Deploy
+
+# Generic deploy workflow for camster91/* apps.
+# Pulls the latest image from ghcr.io and runs it. Works on:
+#   - Coolify (uses the COOLIFY_WEBHOOK_URL secret if set)
+#   - Hostinger VPS with Docker
+#   - Render / Fly.io / Railway (configure their respective webhooks)
+#   - Any local docker host
+#
+# Required secrets:
+#   - DEPLOY_HOST_SSH_KEY (optional) — SSH key for the target host
+#   - DEPLOY_HOST (optional) — hostname/IP for SSH-based deploys
+#   - COOLIFY_WEBHOOK_URL (optional) — Coolify redeploy webhook
+#   - HOSTINGER_FTP_HOST / HOSTINGER_FTP_USER / HOSTINGER_FTP_PASSWORD (optional) — FTP for static sites
+#
+# This workflow is "portable" — it works the same regardless of where the
+# image ends up running. The target host pulls the image and starts it.
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag to deploy (default: main)'
+        required: false
+        type: string
+        default: 'main'
+      host:
+        description: 'Override target host (uses DEPLOY_HOST secret by default)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    name: Notify target host
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Resolve image
+        id: meta
+        run: |
+          TAG="${{ inputs.tag || 'main' }}"
+          IMAGE="ghcr.io/camster91/${{ github.event.repository.name }}:${TAG}"
+          echo "image=${IMAGE}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Webhook to Coolify (if configured)
+        if: ${{ secrets.COOLIFY_WEBHOOK_URL != '' }}
+        run: |
+          echo "Triggering Coolify redeploy webhook..."
+          curl -sf -X POST "${{ secrets.COOLIFY_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"image\":\"${{ steps.meta.outputs.image }}\",\"tag\":\"${{ steps.meta.outputs.tag }}\",\"commit\":\"${{ github.sha }}\"}"
+          echo "Coolify webhook OK"
+
+      - name: SSH deploy (if configured)
+        if: ${{ secrets.DEPLOY_HOST != '' && secrets.DEPLOY_HOST_SSH_KEY != '' }}
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ inputs.host || secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER || 'root' }}
+          key: ${{ secrets.DEPLOY_HOST_SSH_KEY }}
+          script: |
+            set -euo pipefail
+            REPO="${{ github.event.repository.name }}"
+            IMAGE="${{ steps.meta.outputs.image }}"
+            echo "Pulling $IMAGE"
+            docker pull "$IMAGE"
+            echo "Stopping old container (if any)"
+            docker rm -f "$REPO" 2>/dev/null || true
+            echo "Starting new container"
+            docker run -d \
+              --name "$REPO" \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              -e NODE_ENV=production \
+              "$IMAGE"
+            sleep 5
+            echo "Health check"
+            for i in 1 2 3 4 5; do
+              if wget -qO- http://127.0.0.1:3000/api/health > /dev/null 2>&1; then
+                echo "✓ Health check passed"
+                break
+              fi
+              if [ "$i" -eq 5 ]; then
+                echo "✗ Health check failed"
+                docker logs --tail 50 "$REPO"
+                exit 1
+              fi
+              sleep 3
+            done
+
+      - name: Deploy summary
+        run: |
+          echo "## Deployed ${{ github.event.repository.name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.meta.outputs.image }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** \`${{ steps.meta.outputs.tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull anywhere" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ steps.meta.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d -p 3000:3000 --name ${{ github.event.repository.name }} ${{ steps.meta.outputs.image }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
